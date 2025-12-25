@@ -110,54 +110,8 @@ function BackTesting_02()
     offset = subsetCumVol(1);
     localCumVol = subsetCumVol - offset;
     
-    % --- OPTIMIZED: Only smooth a smaller window near the end ---
-    % With causal smoothing, points beyond (leftScope + 2*rightScope) from the end are fixed
-    % So we only need to smooth the window near the end where values can still change
-    leftScope = optimizedParams(1);
-    rightScope = optimizedParams(2);
-    currentVol = currentCumVol(end);
-    
-    % Only smooth points within rightScope of the end (very aggressive optimization)
-    % Points beyond this have enough future data to be fixed with causal smoothing
-    smoothWindowVol = rightScope;
-    smoothStartVol = currentVol - smoothWindowVol;
-    smoothStartIdx = find(subsetCumVol >= max(smoothStartVol, subsetCumVol(1)), 1, 'first');
-    
-    % Debug: check if optimization is working
-    if idx == 100 || idx == 500 || idx == 1000 || idx == 2000  % Print at certain iterations
-        fprintf('Iter %d: Subset size=%d, Smooth window starts at idx=%d (size=%d), smoothWindowVol=%.0f\n', ...
-            idx, length(subsetCumVol), smoothStartIdx, length(subsetCumVol) - smoothStartIdx + 1, smoothWindowVol);
-    end
-    
-    if ~isempty(smoothStartIdx) && smoothStartIdx < length(subsetCumVol) && smoothStartIdx > 1
-        % Only smooth the window near the end (much smaller than full subset)
-        % Include some context before smoothStartIdx for proper smoothing of boundary points
-        % Estimate points needed: approximate by using average volume per point
-        avgVolPerPoint = mean(diff(subsetCumVol(max(1,length(subsetCumVol)-50):end)));
-        contextPoints = min(ceil(leftScope / max(avgVolPerPoint, 1)), smoothStartIdx - 1);
-        contextStartIdx = max(1, smoothStartIdx - contextPoints);
-        
-        smoothPrices = subsetPrices(contextStartIdx:end);
-        smoothCumVol = subsetCumVol(contextStartIdx:end);
-        
-        [smoothedWithContext, pointCountsWithContext] = asymmetricSmoothVolCausal(smoothPrices, smoothCumVol, leftScope, rightScope);
-        
-        % Extract only the window we need (from smoothStartIdx onwards)
-        windowOffset = smoothStartIdx - contextStartIdx;
-        smoothedWindow = smoothedWithContext(windowOffset+1:end);
-        pointCountsWindow = pointCountsWithContext(windowOffset+1:end);
-        
-        % For points before smoothStartIdx, use raw prices (they're not needed for peak detection)
-        smoothedSignalSubset = [subsetPrices(1:smoothStartIdx-1); smoothedWindow];
-        pointCounts = [ones(smoothStartIdx-1, 1); pointCountsWindow];
-    else
-        % Not enough data yet or window is too large, smooth all
-        if idx == 100 || idx == 500 || idx == 1000 || idx == 2000
-            fprintf('Iter %d: Falling back to full smoothing (subset size=%d)\n', idx, length(subsetCumVol));
-        end
-        [smoothedSignalSubset, pointCounts] = asymmetricSmoothVolCausal(subsetPrices, subsetCumVol, leftScope, rightScope);
-    end
-    
+    % --- Compute the smoothed signal using CAUSAL smoothing (historical data only) ---
+    [smoothedSignalSubset, pointCounts] = asymmetricSmoothVolCausal(subsetPrices, subsetCumVol, optimizedParams(1), optimizedParams(2));
     avgPointCount = mean(pointCounts);
     SmoothWindowSize = userParams.SmoothPar * avgPointCount;
     smoothedSignalSubset = smoothdata(smoothedSignalSubset, 'movmean', SmoothWindowSize);
@@ -166,36 +120,17 @@ function BackTesting_02()
     overallSubsetCumVol = localCumVol + offset;
     set(plotSmoothed, 'XData', overallSubsetCumVol, 'YData', smoothedSignalSubset);
     
-    % --- OPTIMIZATION: Only scan for peaks/troughs in a small window near the end ---
-    % Calculate how far back we need to look for new peaks (much smaller than full subset)
+    % --- Find candidate peaks/troughs using causal detection (allowing unconfirmed) ---
     leftExtrScope = optimizedParams(1) * optimizedParams(3);
-    scanWindowVol = leftExtrScope + optimizedParams(2) * 3;  % Enough window for peak detection
-    scanStartVol = currentVol - scanWindowVol;
-    scanStartIdx = find(subsetCumVol >= max(scanStartVol, subsetCumVol(1)), 1, 'first');
-    
-    if ~isempty(scanStartIdx) && scanStartIdx < length(subsetCumVol)
-        % Only process the scan window (much smaller than full subset)
-        scanPrices = smoothedSignalSubset(scanStartIdx:end);
-        scanCumVol = subsetCumVol(scanStartIdx:end);
-        
-        % Find candidate peaks/troughs only in this small window
-        candidatePeaks = findAsymmetricPeaksVolCausal(scanPrices, scanCumVol, leftExtrScope, optimizedParams(2), false);
-        candidateTroughs = findAsymmetricTroughsVolCausal(scanPrices, scanCumVol, leftExtrScope, optimizedParams(2), false);
-        
-        % Adjust indices back to full subset coordinates
-        candidatePeaks = candidatePeaks + scanStartIdx - 1;
-        candidateTroughs = candidateTroughs + scanStartIdx - 1;
-    else
-        % Not enough data yet, use all available
-        candidatePeaks = findAsymmetricPeaksVolCausal(smoothedSignalSubset, subsetCumVol, leftExtrScope, optimizedParams(2), false);
-        candidateTroughs = findAsymmetricTroughsVolCausal(smoothedSignalSubset, subsetCumVol, leftExtrScope, optimizedParams(2), false);
-    end
+    candidatePeaks = findAsymmetricPeaksVolCausal(smoothedSignalSubset, subsetCumVol, leftExtrScope, optimizedParams(2), false);
+    candidateTroughs = findAsymmetricTroughsVolCausal(smoothedSignalSubset, subsetCumVol, leftExtrScope, optimizedParams(2), false);
     
     % Convert local indices to global cumulative volumes
     currentPeakVols = subsetCumVol(candidatePeaks) + offset;
     currentTroughVols = subsetCumVol(candidateTroughs) + offset;
     
     % Find peaks/troughs that can NOW be confirmed (enough future data has arrived)
+    currentVol = currentCumVol(end);
     confirmThreshold = currentVol - optimizedParams(2);  % Need rightScope volume to have passed
     
     % Confirm new peaks
