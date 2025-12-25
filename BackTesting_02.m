@@ -7,17 +7,17 @@ function BackTesting_02()
     %% Define parameters
     userParams.symbol =             'BTCUSDT';
     userParams.interval =           '5m';
-    userParams.OptimiserIterations = 10;
+    userParams.OptimiserIterations = 100;
     userParams.TransactionPercent  = 0.115;
     userParams.StopLoss            = 0.1;
-    userParams.OptimisationDays    = 10;              % (Total historical days to fetch)
-    userParams.lb                  = [10000, 20000, 1]; % lower bounds for parameters [init_s_left, init_xDistance, detect_speed]
-    userParams.ub                  = [20000, 40000, 1]; % upper bounds for parameters [init_s_left, init_xDistance, detect_speed]
+    userParams.OptimisationDays    = 20;              % (Total historical days to fetch)
+    userParams.lb                  = [10000, 10000, 1]; % lower bounds for parameters [init_s_left, init_xDistance, detect_speed]
+    userParams.ub                  = [20000, 20000, 1]; % upper bounds for parameters [init_s_left, init_xDistance, detect_speed]
     userParams.SmoothPar           = 0.5;             % additional smoothing parameter (0.1 to 1), 0.5 best so far
-    userParams.optimMethod         = 'CustomAsymetric'; % extreme detection method for optimisation 'Findpeaks' 'CustomAsymetric' 'Derivative'
-    userParams.simulationMethod    = 'CustomAsymetric';  % For example
+    userParams.optimMethod         = 'Derivative'; % extreme detection method for optimisation 'Findpeaks' 'CustomAsymetric' 'Derivative'
+    userParams.simulationMethod    = 'Derivative';  % For example
     userParams.pauseTime = 10;
-    userParams.FinalOptimisationDate = '30.7.2024'; 
+    userParams.FinalOptimisationDate = '30.9.2024'; 
     userParams.pauseTime = 0; 
 
 
