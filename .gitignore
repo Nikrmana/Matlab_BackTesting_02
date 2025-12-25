@@ -1,0 +1,33 @@
+# MATLAB
+*.asv
+*.m~
+*.fig
+*.fig~
+
+# MATLAB autosave files
+*.autosave
+
+# MATLAB generated files
+*.mexw64
+*.mexa64
+*.mexglx
+*.mexmaci64
+
+# MATLAB cache
+*.mlappinstall
+*.prj
+
+# Temporary files
+*.tmp
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files (optional - remove if you want to track these)
+.vscode/
+.idea/
+
+# Keep your .m files (they're tracked)
+!*.m
