@@ -20,8 +20,8 @@ function [finalHolding, TradeList] = simulateTrading(prices, volumes, times, lef
     % Compute cumulative volume (used as x-axis)
     cumVol = cumsum(volumes);
 
-    % Smoothing using custom asymmetric smoothing
-    [smoothed_full, pointCounts] = asymmetricSmoothVol(prices, cumVol, leftScope, rightScope);
+    % Smoothing using causal asymmetric smoothing (historical data only)
+    [smoothed_full, pointCounts] = asymmetricSmoothVolCausal(prices, cumVol, leftScope, rightScope);
     avgPointCount = mean(pointCounts);
     % fprintf('Average point count: %.2f\n', avgPointCount);
 
@@ -33,8 +33,9 @@ function [finalHolding, TradeList] = simulateTrading(prices, volumes, times, lef
     %%% Peak/Trough detection based on ExtrDetType %%%
     switch ExtrDetType
         case 'CustomAsymetric'
-            peaks   = findAsymmetricPeaksVol(smoothed_full, cumVol, leftExtrScope, rightScope);
-            troughs = findAsymmetricTroughsVol(smoothed_full, cumVol, leftExtrScope, rightScope);
+            % Use causal peak/trough detection with confirmation
+            peaks   = findAsymmetricPeaksVolCausal(smoothed_full, cumVol, leftExtrScope, rightScope, true);
+            troughs = findAsymmetricTroughsVolCausal(smoothed_full, cumVol, leftExtrScope, rightScope, true);
 
         case 'Findpeaks'
             % Use MATLAB built‐in findpeaks with the x vector smoothed_x.

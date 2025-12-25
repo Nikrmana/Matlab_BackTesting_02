@@ -71,6 +71,12 @@ function BackTesting_02()
     accumulatedTradeList = []; % Confirmed (locked-in) trades; each column is a trade
     lastTradeCumVol = -inf; % Overall cumulative volume of the last confirmed trade
     
+    % Initialize confirmed peaks/troughs storage (for stable detection)
+    confirmedPeaks = [];      % Cumulative volume of confirmed peaks
+    confirmedTroughs = [];    % Cumulative volume of confirmed troughs
+    confirmedPeaksData = [];  % Store [cumVol, price] for confirmed peaks
+    confirmedTroughsData = [];% Store [cumVol, price] for confirmed troughs
+    
     % Define the margin as three times the sum of left and right scopes 
     margin = 3 * (optimizedParams(1) + optimizedParams(2));
 
@@ -89,8 +95,6 @@ function BackTesting_02()
     
     %--- Define a subset (window) for processing based on the margin ---%
     % We use the last 'margin' of cumulative volume in this iteration.
-    % --- Define the subset window based on the margin ---
-    
     
     windowStartVol = currentCumVol(end) - margin;
     windowStartVol = max(windowStartVol, currentCumVol(1));
@@ -106,61 +110,180 @@ function BackTesting_02()
     offset = subsetCumVol(1);
     localCumVol = subsetCumVol - offset;
     
-    % --- Compute the smoothed signal using the subset only ---
-    [smoothedSignalSubset, pointCounts] = asymmetricSmoothVol(subsetPrices, subsetCumVol, optimizedParams(1), optimizedParams(2));
+    % --- OPTIMIZED: Only smooth a smaller window near the end ---
+    % With causal smoothing, points beyond (leftScope + 2*rightScope) from the end are fixed
+    % So we only need to smooth the window near the end where values can still change
+    leftScope = optimizedParams(1);
+    rightScope = optimizedParams(2);
+    currentVol = currentCumVol(end);
+    
+    % Only smooth points within rightScope of the end (very aggressive optimization)
+    % Points beyond this have enough future data to be fixed with causal smoothing
+    smoothWindowVol = rightScope;
+    smoothStartVol = currentVol - smoothWindowVol;
+    smoothStartIdx = find(subsetCumVol >= max(smoothStartVol, subsetCumVol(1)), 1, 'first');
+    
+    % Debug: check if optimization is working
+    if idx == 100 || idx == 500 || idx == 1000 || idx == 2000  % Print at certain iterations
+        fprintf('Iter %d: Subset size=%d, Smooth window starts at idx=%d (size=%d), smoothWindowVol=%.0f\n', ...
+            idx, length(subsetCumVol), smoothStartIdx, length(subsetCumVol) - smoothStartIdx + 1, smoothWindowVol);
+    end
+    
+    if ~isempty(smoothStartIdx) && smoothStartIdx < length(subsetCumVol) && smoothStartIdx > 1
+        % Only smooth the window near the end (much smaller than full subset)
+        % Include some context before smoothStartIdx for proper smoothing of boundary points
+        % Estimate points needed: approximate by using average volume per point
+        avgVolPerPoint = mean(diff(subsetCumVol(max(1,length(subsetCumVol)-50):end)));
+        contextPoints = min(ceil(leftScope / max(avgVolPerPoint, 1)), smoothStartIdx - 1);
+        contextStartIdx = max(1, smoothStartIdx - contextPoints);
+        
+        smoothPrices = subsetPrices(contextStartIdx:end);
+        smoothCumVol = subsetCumVol(contextStartIdx:end);
+        
+        [smoothedWithContext, pointCountsWithContext] = asymmetricSmoothVolCausal(smoothPrices, smoothCumVol, leftScope, rightScope);
+        
+        % Extract only the window we need (from smoothStartIdx onwards)
+        windowOffset = smoothStartIdx - contextStartIdx;
+        smoothedWindow = smoothedWithContext(windowOffset+1:end);
+        pointCountsWindow = pointCountsWithContext(windowOffset+1:end);
+        
+        % For points before smoothStartIdx, use raw prices (they're not needed for peak detection)
+        smoothedSignalSubset = [subsetPrices(1:smoothStartIdx-1); smoothedWindow];
+        pointCounts = [ones(smoothStartIdx-1, 1); pointCountsWindow];
+    else
+        % Not enough data yet or window is too large, smooth all
+        if idx == 100 || idx == 500 || idx == 1000 || idx == 2000
+            fprintf('Iter %d: Falling back to full smoothing (subset size=%d)\n', idx, length(subsetCumVol));
+        end
+        [smoothedSignalSubset, pointCounts] = asymmetricSmoothVolCausal(subsetPrices, subsetCumVol, leftScope, rightScope);
+    end
+    
     avgPointCount = mean(pointCounts);
     SmoothWindowSize = userParams.SmoothPar * avgPointCount;
     smoothedSignalSubset = smoothdata(smoothedSignalSubset, 'movmean', SmoothWindowSize);
     
     % For plotting purposes, shift the local cumulative volume back to the overall scale.
     overallSubsetCumVol = localCumVol + offset;
-     set(plotSmoothed, 'XData', overallSubsetCumVol, 'YData', smoothedSignalSubset);
-    % set(plotPrice,    'XData', overallSubsetCumVol, 'YData', subsetPrices);
+    set(plotSmoothed, 'XData', overallSubsetCumVol, 'YData', smoothedSignalSubset);
     
-    % hold on; 
-    % plot(overallSubsetCumVol, subsetPrices, 'b-');
-
-    % --- Run simulation on only the subset to get candidate trades ---
-    [~, simTradeListSubset] = simulateTrading(subsetPrices, subsetVolumes, subsetTimes, ...
-        optimizedParams(1), optimizedParams(2), optimizedParams(3), ...
-        Fee, userParams.StopLoss, userParams.simulationMethod, userParams.SmoothPar);
+    % --- OPTIMIZATION: Only scan for peaks/troughs in a small window near the end ---
+    % Calculate how far back we need to look for new peaks (much smaller than full subset)
+    leftExtrScope = optimizedParams(1) * optimizedParams(3);
+    scanWindowVol = leftExtrScope + optimizedParams(2) * 3;  % Enough window for peak detection
+    scanStartVol = currentVol - scanWindowVol;
+    scanStartIdx = find(subsetCumVol >= max(scanStartVol, subsetCumVol(1)), 1, 'first');
     
-    % Adjust the candidate trades’ cumulative volumes back to overall scale.
-    if ~isempty(simTradeListSubset)
-        simTradeListSubset(1,:) = simTradeListSubset(1,:) + offset;
+    if ~isempty(scanStartIdx) && scanStartIdx < length(subsetCumVol)
+        % Only process the scan window (much smaller than full subset)
+        scanPrices = smoothedSignalSubset(scanStartIdx:end);
+        scanCumVol = subsetCumVol(scanStartIdx:end);
+        
+        % Find candidate peaks/troughs only in this small window
+        candidatePeaks = findAsymmetricPeaksVolCausal(scanPrices, scanCumVol, leftExtrScope, optimizedParams(2), false);
+        candidateTroughs = findAsymmetricTroughsVolCausal(scanPrices, scanCumVol, leftExtrScope, optimizedParams(2), false);
+        
+        % Adjust indices back to full subset coordinates
+        candidatePeaks = candidatePeaks + scanStartIdx - 1;
+        candidateTroughs = candidateTroughs + scanStartIdx - 1;
+    else
+        % Not enough data yet, use all available
+        candidatePeaks = findAsymmetricPeaksVolCausal(smoothedSignalSubset, subsetCumVol, leftExtrScope, optimizedParams(2), false);
+        candidateTroughs = findAsymmetricTroughsVolCausal(smoothedSignalSubset, subsetCumVol, leftExtrScope, optimizedParams(2), false);
     end
     
-    % --- Determine candidate trade from the subset ---
+    % Convert local indices to global cumulative volumes
+    currentPeakVols = subsetCumVol(candidatePeaks) + offset;
+    currentTroughVols = subsetCumVol(candidateTroughs) + offset;
+    
+    % Find peaks/troughs that can NOW be confirmed (enough future data has arrived)
+    confirmThreshold = currentVol - optimizedParams(2);  % Need rightScope volume to have passed
+    
+    % Confirm new peaks
+    for i = 1:length(currentPeakVols)
+        peakVol = currentPeakVols(i);
+        peakLocalIdx = candidatePeaks(i);
+        if peakVol <= confirmThreshold && ~ismember(peakVol, confirmedPeaks)
+            % Find the trade execution point (shifted by rightScope)
+            peakGlobalIdx = newStartIdx + peakLocalIdx - 1;
+            volTrans = peakVol + optimizedParams(2);
+            tradeIdx = find(currentCumVol >= volTrans, 1, 'first');
+            if isempty(tradeIdx)
+                tradeIdx = length(currentCumVol);
+            end
+            tradePrice = currentPrices(tradeIdx);
+            confirmedPeaks(end+1) = peakVol; %#ok<AGROW>
+            confirmedPeaksData = [confirmedPeaksData; peakVol, tradePrice]; %#ok<AGROW>
+        end
+    end
+    
+    % Confirm new troughs
+    for i = 1:length(currentTroughVols)
+        troughVol = currentTroughVols(i);
+        troughLocalIdx = candidateTroughs(i);
+        if troughVol <= confirmThreshold && ~ismember(troughVol, confirmedTroughs)
+            % Find the trade execution point (shifted by rightScope)
+            troughGlobalIdx = newStartIdx + troughLocalIdx - 1;
+            volTrans = troughVol + optimizedParams(2);
+            tradeIdx = find(currentCumVol >= volTrans, 1, 'first');
+            if isempty(tradeIdx)
+                tradeIdx = length(currentCumVol);
+            end
+            tradePrice = currentPrices(tradeIdx);
+            confirmedTroughs(end+1) = troughVol; %#ok<AGROW>
+            confirmedTroughsData = [confirmedTroughsData; troughVol, tradePrice]; %#ok<AGROW>
+        end
+    end
+    
+    % --- Build TradeList from CONFIRMED peaks/troughs only ---
+    % Sort all confirmed events by cumulative volume
     newTrade = [];
-    if ~isempty(simTradeListSubset)
-        candidateIndices = find(simTradeListSubset(1,:) > lastTradeCumVol);
-        if ~isempty(candidateIndices)
-            % Pick the candidate with the highest cumulative volume (i.e. the most recent new trade)
-            candidateTrade = simTradeListSubset(:, candidateIndices(end));
+    if ~isempty(confirmedPeaksData) || ~isempty(confirmedTroughsData)
+        % Combine peaks and troughs with type indicator
+        allEvents = [];
+        if ~isempty(confirmedPeaksData)
+            allEvents = [allEvents; confirmedPeaksData, ones(size(confirmedPeaksData,1),1)]; % 1 = peak/sell
+        end
+        if ~isempty(confirmedTroughsData)
+            allEvents = [allEvents; confirmedTroughsData, zeros(size(confirmedTroughsData,1),1)]; % 0 = trough/buy
+        end
+        
+        % Sort by cumulative volume
+        allEvents = sortrows(allEvents, 1);
+        
+        % Find the most recent confirmed event that hasn't been traded yet
+        for eventIdx = 1:size(allEvents, 1)
+            eventVol = allEvents(eventIdx, 1);
+            eventPrice = allEvents(eventIdx, 2);
+            eventIsPeak = (allEvents(eventIdx, 3) == 1);
             
-            % Determine candidate trade type: buy if candidateTrade(2) > 0; sell if candidateTrade(3) > 0.
-            candidateIsBuy = candidateTrade(2) > 0;
-            candidateIsSell = candidateTrade(3) > 0;
-            
-            % (Optional) Check that candidate is of a different type than the last locked trade.
-            if ~isempty(accumulatedTradeList)
-                lastTrade = accumulatedTradeList(:, end);
-                lastTradeIsBuy = lastTrade(2) > 0;
-                lastTradeIsSell = lastTrade(3) > 0;
-                if (candidateIsBuy && lastTradeIsBuy) || (candidateIsSell && lastTradeIsSell)
-                    newTrade = [];
-                else
-                    newTrade = candidateTrade;
+            % Check if this event is after the last traded event
+            if eventVol > lastTradeCumVol
+                % Check that it's different type from last trade
+                if ~isempty(accumulatedTradeList)
+                    lastTrade = accumulatedTradeList(:, end);
+                    lastTradeIsBuy = lastTrade(2) > 0;
+                    if (eventIsPeak && lastTradeIsBuy) || (~eventIsPeak && ~lastTradeIsBuy)
+                        % Same type, skip
+                        continue;
+                    end
                 end
-            else
-                newTrade = candidateTrade;
+                
+                % This is a valid new trade
+                if eventIsPeak
+                    newTrade = [eventVol; 0; eventPrice];  % Sell trade
+                else
+                    newTrade = [eventVol; eventPrice; 0];  % Buy trade
+                end
+                break;  % Take the first valid new trade
             end
         end
     end
     
     % --- If a new trade candidate is found, update trading state and accumulate the trade ---
     if ~isempty(newTrade)
-        % newTrade(1) contains the trade's cumulative volume; candidateTrade(2) or (3) is the trade price.
+        candidateIsBuy = newTrade(2) > 0;
+        candidateIsSell = newTrade(3) > 0;
+        
         if candidateIsBuy  % (Trough event): Execute a buy (go long)
             if ~strcmp(position, 'long')
                 % If currently short, close short first
