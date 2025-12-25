@@ -125,19 +125,50 @@ function BackTesting_02()
     candidatePeaks = findAsymmetricPeaksVolCausal(smoothedSignalSubset, subsetCumVol, leftExtrScope, optimizedParams(2), false);
     candidateTroughs = findAsymmetricTroughsVolCausal(smoothedSignalSubset, subsetCumVol, leftExtrScope, optimizedParams(2), false);
     
+    % Debug output (only print occasionally to avoid spam)
+    if mod(idx, 500) == 0 || idx == numTicks || (length(candidateTroughs) > 0 && mod(idx, 100) == 0)
+        fprintf('Iter %d: Found %d candidate peaks, %d candidate troughs\n', idx, length(candidatePeaks), length(candidateTroughs));
+        if length(candidateTroughs) > 0
+            fprintf('  Trough volumes: ');
+            fprintf('%.0f ', currentTroughVols);
+            fprintf('\n');
+        end
+        if length(candidatePeaks) > 0 && mod(idx, 500) == 0
+            fprintf('  Peak volumes: ');
+            fprintf('%.0f ', currentPeakVols(1:min(5, length(currentPeakVols))));
+            if length(currentPeakVols) > 5
+                fprintf('... (%d total)', length(currentPeakVols));
+            end
+            fprintf('\n');
+        end
+    end
+    
     % Convert local indices to global cumulative volumes
-    currentPeakVols = subsetCumVol(candidatePeaks) + offset;
-    currentTroughVols = subsetCumVol(candidateTroughs) + offset;
+    currentPeakVols = subsetCumVol(candidatePeaks);
+    currentTroughVols = subsetCumVol(candidateTroughs);
     
     % Find peaks/troughs that can NOW be confirmed (enough future data has arrived)
-    currentVol = currentCumVol(end);
-    confirmThreshold = currentVol - optimizedParams(2);  % Need rightScope volume to have passed
+    % Use the GLOBAL current cumulative volume (not subset)
+    currentVol = RealCumVolumes(idx);  % Current global cumulative volume
+    lookaheadVol = optimizedParams(2);
+    
+    confirmThreshold = currentVol - lookaheadVol;
+    % Debug: show threshold occasionally
+    if mod(idx, 500) == 0 && (length(currentPeakVols) > 0 || length(currentTroughVols) > 0)
+        fprintf('  Current vol=%.0f, rightScope=%.0f, confirmThreshold=%.0f\n', ...
+            currentVol, optimizedParams(2), confirmThreshold);
+        if length(currentTroughVols) > 0
+            fprintf('  First trough vol=%.0f, canConfirm=%d\n', ...
+                currentTroughVols(1), currentTroughVols(1) <= confirmThreshold);
+        end
+    end
     
     % Confirm new peaks
+    newPeaksConfirmed = 0;
     for i = 1:length(currentPeakVols)
         peakVol = currentPeakVols(i);
         peakLocalIdx = candidatePeaks(i);
-        if peakVol <= confirmThreshold && ~ismember(peakVol, confirmedPeaks)
+        if (currentVol >= peakVol + lookaheadVol) && ~ismember(peakVol, confirmedPeaks)
             % Find the trade execution point (shifted by rightScope)
             peakGlobalIdx = newStartIdx + peakLocalIdx - 1;
             volTrans = peakVol + optimizedParams(2);
@@ -148,14 +179,23 @@ function BackTesting_02()
             tradePrice = currentPrices(tradeIdx);
             confirmedPeaks(end+1) = peakVol; %#ok<AGROW>
             confirmedPeaksData = [confirmedPeaksData; peakVol, tradePrice]; %#ok<AGROW>
+            newPeaksConfirmed = newPeaksConfirmed + 1;
         end
     end
     
     % Confirm new troughs
+    newTroughsConfirmed = 0;
     for i = 1:length(currentTroughVols)
         troughVol = currentTroughVols(i);
         troughLocalIdx = candidateTroughs(i);
-        if troughVol <= confirmThreshold && ~ismember(troughVol, confirmedTroughs)
+        
+        % Debug: check why troughs aren't being confirmed
+        if length(currentTroughVols) > 0 && mod(idx, 200) == 0 && i == 1
+            fprintf('  Trough confirmation check: vol=%.0f, threshold=%.0f, canConfirm=%d, alreadyConfirmed=%d\n', ...
+                troughVol, confirmThreshold, troughVol <= confirmThreshold, ismember(troughVol, confirmedTroughs));
+        end
+        
+        if (currentVol >= troughVol + lookaheadVol) && ~ismember(troughVol, confirmedTroughs)
             % Find the trade execution point (shifted by rightScope)
             troughGlobalIdx = newStartIdx + troughLocalIdx - 1;
             volTrans = troughVol + optimizedParams(2);
@@ -166,7 +206,14 @@ function BackTesting_02()
             tradePrice = currentPrices(tradeIdx);
             confirmedTroughs(end+1) = troughVol; %#ok<AGROW>
             confirmedTroughsData = [confirmedTroughsData; troughVol, tradePrice]; %#ok<AGROW>
+            newTroughsConfirmed = newTroughsConfirmed + 1;
         end
+    end
+    
+    % Debug output for confirmations
+    if (newPeaksConfirmed > 0 || newTroughsConfirmed > 0) && mod(idx, 100) == 0
+        fprintf('Iter %d: Confirmed %d new peaks, %d new troughs (Total: %d peaks, %d troughs)\n', ...
+            idx, newPeaksConfirmed, newTroughsConfirmed, length(confirmedPeaks), length(confirmedTroughs));
     end
     
     % --- Build TradeList from CONFIRMED peaks/troughs only ---
@@ -186,6 +233,7 @@ function BackTesting_02()
         allEvents = sortrows(allEvents, 1);
         
         % Find the most recent confirmed event that hasn't been traded yet
+        % Process events in order and only take the FIRST one that's valid
         for eventIdx = 1:size(allEvents, 1)
             eventVol = allEvents(eventIdx, 1);
             eventPrice = allEvents(eventIdx, 2);
@@ -193,34 +241,53 @@ function BackTesting_02()
             
             % Check if this event is after the last traded event
             if eventVol > lastTradeCumVol
-                % Check that it's different type from last trade
+                % Check that it's different type from last trade AND current position
+                isValidTrade = true;
+                
                 if ~isempty(accumulatedTradeList)
-                    lastTrade = accumulatedTradeList(:, end);
-                    lastTradeIsBuy = lastTrade(2) > 0;
-                    if (eventIsPeak && lastTradeIsBuy) || (~eventIsPeak && ~lastTradeIsBuy)
-                        % Same type, skip
-                        continue;
+                lastTrade = accumulatedTradeList(:, end);
+                lastTradeIsBuy = lastTrade(2) > 0;
+                lastTradeIsSell = lastTrade(3) > 0;
+                % Skip if same type as last trade
+                if (eventIsPeak && lastTradeIsSell) || (~eventIsPeak && lastTradeIsBuy)
+                    isValidTrade = false;
+                end
+                end
+                
+                % Also check current position - can't sell if already short, can't buy if already long
+                if isValidTrade
+                    if eventIsPeak && strcmp(position, 'short')
+                        isValidTrade = false;  % Already short, can't sell again
+                    elseif ~eventIsPeak && strcmp(position, 'long')
+                        isValidTrade = false;  % Already long, can't buy again
                     end
                 end
                 
                 % This is a valid new trade
-                if eventIsPeak
-                    newTrade = [eventVol; 0; eventPrice];  % Sell trade
-                else
-                    newTrade = [eventVol; eventPrice; 0];  % Buy trade
+                if isValidTrade
+                    if eventIsPeak
+                        newTrade = [eventVol; 0; eventPrice];  % Sell trade
+                    else
+                        newTrade = [eventVol; eventPrice; 0];  % Buy trade
+                    end
+                    break;  % Take the first valid new trade and stop
                 end
-                break;  % Take the first valid new trade
             end
         end
     end
     
     % --- If a new trade candidate is found, update trading state and accumulate the trade ---
+    % Only execute if newTrade is still valid (not cleared by safety checks)
     if ~isempty(newTrade)
         candidateIsBuy = newTrade(2) > 0;
         candidateIsSell = newTrade(3) > 0;
         
         if candidateIsBuy  % (Trough event): Execute a buy (go long)
-            if ~strcmp(position, 'long')
+            % Safety check: should not happen if we're already long (checked above)
+            if strcmp(position, 'long')
+                warning('Attempted to buy while already long - skipping');
+                newTrade = [];  % Clear the trade to prevent execution
+            else
                 % If currently short, close short first
                 if strcmp(position, 'short')
                     USDT = USDT - BTCshort * newTrade(2) * (1 + Fee);
@@ -234,7 +301,11 @@ function BackTesting_02()
                 entryPrice = newTrade(2);
             end
         elseif candidateIsSell  % (Peak event): Execute a sell (go short)
-            if ~strcmp(position, 'short')
+            % Safety check: should not happen if we're already short (checked above)
+            if strcmp(position, 'short')
+                warning('Attempted to sell while already short - skipping');
+                newTrade = [];  % Clear the trade to prevent execution
+            else
                 % If currently long, close long first by selling BTC
                 if strcmp(position, 'long')
                     USDT = USDT + BTC * newTrade(3) * (1 - Fee);
@@ -256,10 +327,12 @@ function BackTesting_02()
             oldX = get(plotTradeLong, 'XData');
             oldY = get(plotTradeLong, 'YData');
             set(plotTradeLong, 'XData', [oldX, newTrade(1)], 'YData', [oldY, newTrade(2)]);
+            fprintf('BUY trade executed at vol=%.0f, price=%.2f\n', newTrade(1), newTrade(2));
         elseif candidateIsSell
             oldX = get(plotTradeShort, 'XData');
             oldY = get(plotTradeShort, 'YData');
             set(plotTradeShort, 'XData', [oldX, newTrade(1)], 'YData', [oldY, newTrade(3)]);
+            fprintf('SELL trade executed at vol=%.0f, price=%.2f\n', newTrade(1), newTrade(3));
         end
         drawnow;
     end
@@ -276,9 +349,26 @@ function BackTesting_02()
     drawnow;
     
     pause(userParams.pauseTime);
-
-
     end
+    
+    % Final summary
+    fprintf('\n=== Simulation Complete ===\n');
+    fprintf('Total confirmed peaks: %d\n', length(confirmedPeaks));
+    fprintf('Total confirmed troughs: %d\n', length(confirmedTroughs));
+    fprintf('Total trades executed: %d\n', size(accumulatedTradeList, 2));
+    if ~isempty(accumulatedTradeList)
+        fprintf('Trade breakdown:\n');
+        for t = 1:size(accumulatedTradeList, 2)
+            trade = accumulatedTradeList(:, t);
+            if trade(2) > 0
+                fprintf('  Trade %d: BUY at vol=%.0f, price=%.2f\n', t, trade(1), trade(2));
+            else
+                fprintf('  Trade %d: SELL at vol=%.0f, price=%.2f\n', t, trade(1), trade(3));
+            end
+        end
+    end
+    fprintf('Final holding: %.2f USDT\n', currentHolding);
+    fprintf('===========================\n');
 
 
 
